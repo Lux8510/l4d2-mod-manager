@@ -23,3 +23,6 @@ addonlist.txt
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地自检产物
+_exe_selftest.txt
