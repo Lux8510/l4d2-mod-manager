@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.manifest
+
+# 本地运行产物
+python-embed/
+*.exe
+*.zip
+*.log
+_manager_backup/
+addonlist.txt
+.l4d2_manager_state.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "addons_dir": "/mnt/c/Temp/repo_demo/left4dead2/addons",
+  "summary": {
+    "enabled": 3,
+    "disabled": 0,
+    "conflicts": 2,
+    "pairs": 1
+  },
+  "webview_available": false,
+  "tkinter_available": false,
+  "page_bundled": false
+}

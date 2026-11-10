@@ -1,0 +1,45 @@
+name: build-windows
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name L4D2ModManager --paths src --add-data "page.html;."
+          --collect-all webview --collect-all clr_loader
+          --hidden-import clr --hidden-import pythonnet
+          --hidden-import tkinter --hidden-import tkinter.filedialog
+          --hidden-import tkinter.messagebox
+          src/l4d2_webapp.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: L4D2ModManager-windows
+          path: dist/L4D2ModManager.exe
+          if-no-files-found: error
+
+      - name: Attach to release (tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/L4D2ModManager.exe
