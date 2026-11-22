@@ -442,7 +442,7 @@ class App:
         ctk.CTkButton(ctrl, text="只保留此", width=74, height=30, corner_radius=8,
                       font=font(10), fg_color="#2f3a24", hover_color="#3a4a2c",
                       text_color="#bfe08a",
-                      command=lambda c=c, a=a: self._keep_only(c, a["uid"])
+                      command=lambda c=c, a=a: self._keep_only(c, a["unit_id"])
                       ).pack(side="left", padx=4)
         if a.get("workshop_id"):
             ctk.CTkButton(ctrl, text="工坊", width=46, height=30, corner_radius=8,
@@ -452,7 +452,7 @@ class App:
         ctk.CTkButton(ctrl, text="文件夹", width=58, height=30, corner_radius=8,
                       font=font(10), fg_color=SURFACE, hover_color=SURFACE_HI,
                       command=lambda a=a: self._do(self.manager.open_folder,
-                                                   a.get("unit_id") or a["location"], refresh=False)
+                                                   a["unit_id"], a["version"], refresh=False)
                       ).pack(side="left", padx=3)
         sw = ctk.CTkSwitch(ctrl, text="启用", font=font(10), width=44,
                            progress_color=GREEN, button_color="#ffffff",
@@ -465,7 +465,7 @@ class App:
         if bool(sw.get()):
             return  # 目前是启用状态,无需处理
         try:
-            ok, msg = self.manager.disable(a.get("unit_id") or a["uid"])
+            ok, msg = self.manager.disable(a["unit_id"], a["version"])
         except Exception as e:  # noqa
             ok, msg = False, str(e)
         if not ok:
@@ -476,7 +476,7 @@ class App:
         self.refresh()
 
     def _keep_only(self, c, keep_uid):
-        others = [a for a in c["addons"] if a["uid"] != keep_uid]
+        others = [a for a in c["addons"] if a["unit_id"] != keep_uid]
         if not others:
             return
         names = "\n".join("· " + a["display_name"] for a in others)
@@ -484,15 +484,8 @@ class App:
                 "只保留此模组",
                 f"将关闭以下 {len(others)} 个模组(可逆):\n\n{names}\n\n继续?"):
             return
-        for a in others:
-            try:
-                ok, msg = self.manager.disable(a.get("unit_id") or a["uid"])
-            except Exception as e:  # noqa
-                ok, msg = False, str(e)
-            if not ok:
-                messagebox.showerror("操作失败", msg)
-                break
-        self.refresh()
+        versions = {a["unit_id"]: a["version"] for a in c["addons"]}
+        self._do(self.manager.keep_only, keep_uid, versions)
 
     def render_addons(self):
         if self.state is None:
@@ -591,7 +584,7 @@ class App:
         ctk.CTkButton(ctrl, text="文件夹", width=58, height=30, corner_radius=8,
                       font=font(10), fg_color=SURFACE_ALT, hover_color=SURFACE_HI,
                       command=lambda a=a: self._do(self.manager.open_folder,
-                                                   a.get("unit_id") or a["location"], refresh=False)
+                                                   a["unit_id"], a["version"], refresh=False)
                       ).pack(side="left", padx=3)
         ctk.CTkButton(ctrl, text="删除", width=46, height=30, corner_radius=8,
                       font=font(10), fg_color="#3a2526", hover_color="#4a2c2d",
@@ -629,7 +622,7 @@ class App:
             return
         fn = self.manager.enable if want_enable else self.manager.disable
         try:
-            ok, msg = fn(a.get("unit_id") or a["uid"])
+            ok, msg = fn(a["unit_id"], a["version"])
         except Exception as e:  # noqa
             ok, msg = False, str(e)
         if not ok:
@@ -655,7 +648,7 @@ class App:
             self.set_status("已取消删除")
             return
         try:
-            ok, msg = self.manager.delete(a.get("unit_id") or a["uid"])
+            ok, msg = self.manager.delete(a["unit_id"], a["version"])
         except Exception as e:  # noqa
             ok, msg = False, str(e)
         if ok:
@@ -732,7 +725,7 @@ class ConflictDialog:
                                progress_color=GREEN, button_color="#ffffff",
                                button_hover_color="#ffffff")
             sw.select()
-            sw.configure(command=lambda u=a.get("unit_id") or a["uid"]: self._toggle_off(u))
+            sw.configure(command=lambda a=a: self._toggle_off(a))
             sw.pack(side="left", padx=(0, 10))
             if a.get("workshop_id"):
                 ctk.CTkButton(btns, text="工坊", width=56, height=30, corner_radius=8,
@@ -741,34 +734,33 @@ class ConflictDialog:
                               ).pack(side="left", padx=3)
             ctk.CTkButton(btns, text="文件夹", width=64, height=30, corner_radius=8,
                           font=font(10), fg_color=SURFACE_ALT, hover_color=SURFACE_HI,
-                          command=lambda p=a.get("unit_id") or a["location"]: self._safe(self.manager.open_folder, p)
+                          command=lambda a=a: self._safe(self.manager.open_folder, a["unit_id"], a["version"])
                           ).pack(side="left", padx=3)
             ctk.CTkButton(btns, text="隔离", width=56, height=30, corner_radius=8,
                           font=font(10), fg_color=ACCENT, hover_color=ACCENT_HOVER,
                           text_color="#1a1008",
-                          command=lambda u=a.get("unit_id") or a["uid"]: self._isolate(u)).pack(side="left", padx=3)
+                          command=lambda a=a: self._isolate(a)).pack(side="left", padx=3)
 
         ctk.CTkButton(win, text="关闭", width=100, height=36, corner_radius=9,
                       font=font(11), fg_color=SURFACE_ALT, hover_color=SURFACE_HI,
                       command=win.destroy).pack(pady=(0, 16))
 
     def _safe(self, fn, *args):
-        ok, msg = fn(*args)
+        try:
+            ok, msg = fn(*args)
+        except Exception as error:
+            ok, msg = False, str(error)
         if not ok:
             messagebox.showerror("操作失败", msg, parent=self.win)
 
-    def _isolate(self, uid):
-        ok, msg = self.manager.disable(uid)
-        if ok:
-            messagebox.showinfo("完成", msg, parent=self.win)
-            self.win.destroy()
-            if self.on_action:
-                self.on_action()
-        else:
-            messagebox.showerror("操作失败", msg, parent=self.win)
+    def _isolate(self, addon):
+        self._toggle_off(addon)
 
-    def _toggle_off(self, uid):
-        ok, msg = self.manager.disable(uid)
+    def _toggle_off(self, addon):
+        try:
+            ok, msg = self.manager.disable(addon["unit_id"], addon["version"])
+        except Exception as error:
+            ok, msg = False, str(error)
         if ok:
             messagebox.showinfo("已关闭", msg, parent=self.win)
             self.win.destroy()

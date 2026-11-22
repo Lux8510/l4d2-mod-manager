@@ -52,6 +52,13 @@ import re
 import struct
 import sys
 import time
+import stat
+import copy
+import errno
+import tempfile
+import threading
+from contextlib import ExitStack, contextmanager
+from itertools import combinations
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
@@ -110,7 +117,7 @@ class VpkEntry:
 class Vpk:
     """最小可用的 VPK 读取器:只解析目录树,并可按需提取单个文件。"""
 
-    def __init__(self, dir_path):
+    def __init__(self, dir_path, *, charge_tree=None):
         self.dir_path = dir_path
         self.version = None
         self.header_size = None
@@ -119,20 +126,18 @@ class Vpk:
         self._lower_index = {}      # 小写路径 -> 原样路径
         self.file_data_section_size = None
         self.file_size = 0
-        self._parse()
+        self._parse(charge_tree)
 
     # -- 内部工具 -----------------------------------------------------------
-    def _is_archive_part(self):
-        """名称形如 xxx_000.vpk 的是数据分卷,没有目录树。"""
-        base = os.path.basename(self.dir_path).lower()
-        stem = base[:-4] if base.endswith(".vpk") else base
-        return bool(re.search(r"_\d{3}$", stem))
-
     MAX_TREE = 64 * 1024 * 1024
+    MAX_ENTRIES = 250_000
+    MAX_PATH_LENGTH = 1024
+    MAX_EXPANDED = 32 * 1024 * 1024
+    MAX_EXTRACT = 64 * 1024 * 1024
 
-    def _parse(self):
+    def _parse(self, charge_tree):
         try:
-            f = open(self.dir_path, "rb")
+            f = open_checked_binary(self.dir_path)
         except OSError as e:
             raise VpkError(f"无法打开文件: {e}")
         with f:
@@ -143,8 +148,6 @@ class Vpk:
             magic, version, tree_size = struct.unpack("<III", head)
             if magic != VPK_MAGIC:
                 raise VpkError("Magic 不匹配,不是 VPK 目录文件")
-            if self._is_archive_part():
-                raise VpkError("这是数据分卷(_NNN.vpk),不含目录树")
             data_size = None
             if version == 1:
                 header_size = 12
@@ -159,8 +162,11 @@ class Vpk:
 
             if tree_size > self.MAX_TREE:
                 raise VpkError("目录树过大")
-            if header_size + tree_size > file_size:
+            remaining = file_size - header_size - tree_size
+            if remaining < 0:
                 raise VpkError("目录树超出文件范围")
+            if version == 2 and data_size + _amd5 + _omd5 + _sig > remaining:
+                raise VpkError("VPK v2 节超出文件范围")
 
             self.version = version
             self.tree_size = tree_size
@@ -168,15 +174,37 @@ class Vpk:
             self.file_data_section_size = data_size
             self.file_size = file_size
 
+            if charge_tree is not None:
+                charge_tree(tree_size)
             f.seek(header_size)
             tree = f.read(tree_size)
             if len(tree) != tree_size:
                 raise VpkError("目录树被截断,文件可能损坏")
             self._parse_tree(tree)
+            sizes = {self.dir_path: header_size + tree_size +
+                     (remaining if version == 1 else data_size)}
+            self.archive_paths = set()
+            for entry in self.entries.values():
+                if not entry.length:
+                    continue
+                source, offset = self._data_source(entry)
+                if source != self.dir_path:
+                    self.archive_paths.add(source)
+                if source not in sizes:
+                    try:
+                        info = checked_stat(source)
+                        if info is None or not stat.S_ISREG(info.st_mode):
+                            raise OSError("分卷不存在或不是普通文件")
+                        sizes[source] = info.st_size
+                    except OSError as error:
+                        raise VpkError(f"分卷不可用 {source}: {error}") from error
+                if offset + entry.length > sizes[source]:
+                    raise VpkError(f"条目超出数据范围: {source}")
 
     def _parse_tree(self, tree):
         pos = 0
         n = len(tree)
+        count = expanded = 0
 
         def read_cstr(what):
             nonlocal pos
@@ -185,6 +213,8 @@ class Vpk:
             end = tree.find(b"\x00", pos)
             if end < 0:
                 raise VpkError(f"目录字符串缺少结束符({what})")
+            if end - pos > self.MAX_PATH_LENGTH:
+                raise VpkError("VPK 路径字段过长")
             raw = tree[pos:end]
             pos = end + 1
             return raw
@@ -218,13 +248,23 @@ class Vpk:
                         raise VpkError("preload 越界")
                     preload_data = tree[pos:pos + preload]
                     pos += preload
+                    count += 1
+                    path_length = len(path) + len(name) + len(ext) + 2
+                    expanded += path_length + preload
+                    if (path_length > self.MAX_PATH_LENGTH or count > self.MAX_ENTRIES or
+                            expanded > self.MAX_EXPANDED):
+                        raise VpkError("VPK 条目数或展开大小超出扫描上限")
                     if ext_s == " ":
                         full = (path_s + "/" if path_s else "") + name_s
                     else:
                         full = (path_s + "/" if path_s else "") + name_s + "." + ext_s
+                    if full.lower() in self._lower_index:
+                        raise VpkError("VPK 包含重复路径")
                     self.entries[full] = VpkEntry(
                         crc, preload_data, arch_idx, off, length)
                     self._lower_index[full.lower()] = full
+        if pos != n:
+            raise VpkError("VPK 目录树终止符之后仍有数据")
 
     # -- 提取 ---------------------------------------------------------------
     def _data_source(self, entry):
@@ -245,11 +285,13 @@ class Vpk:
         if key is None:
             raise VpkError(f"VPK 中不存在文件: {fullpath}")
         entry = self.entries[key]
+        if len(entry.preload) + entry.length > self.MAX_EXTRACT:
+            raise VpkError("提取条目超出大小上限")
         if entry.length == 0:
             return entry.preload
         src, offset = self._data_source(entry)
         try:
-            with open(src, "rb") as f:
+            with open_checked_binary(src) as f:
                 size = os.fstat(f.fileno()).st_size
                 if entry.archive_index == EMBEDDED_INDEX:
                     data_start = self.header_size + self.tree_size
@@ -468,15 +510,15 @@ def _direct_game_candidates():
     return out
 
 
-def _running_game_dirs():
+def _running_game_dirs(*, presence_only=False):
     """通过进程快照找到正在运行的 left4dead2.exe 所在的游戏目录。"""
     if os.name != "nt":
         return []
     try:
         import ctypes
         from ctypes import wintypes
-    except Exception:  # noqa
-        return []
+    except Exception:
+        return None if presence_only else []
 
     TH32CS_SNAPPROCESS = 0x00000002
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -512,14 +554,18 @@ def _running_game_dirs():
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if not snap or snap == ctypes.c_void_p(-1).value:
-            return []
+            return None if presence_only else []
         dirs = []
         try:
             entry = PROCESSENTRY32W()
             entry.dwSize = ctypes.sizeof(entry)
             ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+            if not ok:
+                return None if presence_only else []
             while ok:
                 if entry.szExeFile.lower() in ("left4dead2.exe", "left4dead2"):
+                    if presence_only:
+                        return True
                     h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
                                         entry.th32ProcessID)
                     if h:
@@ -532,11 +578,13 @@ def _running_game_dirs():
                         finally:
                             k32.CloseHandle(h)
                 ok = k32.Process32NextW(snap, ctypes.byref(entry))
+            if presence_only:
+                return False if ctypes.get_last_error() == 18 else None
         finally:
             k32.CloseHandle(snap)
         return dirs
-    except Exception:  # noqa
-        return []
+    except Exception:
+        return None if presence_only else []
 
 
 def get_device_info(game_dir):
@@ -578,29 +626,53 @@ def get_device_info(game_dir):
     except Exception:
         pass
     try:
-        import subprocess as _sp
-        import json as _json
-        flags = 0x08000000 if os.name == "nt" else 0
-        out = _sp.check_output(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_VideoController | Select-Object -First 1 "
-             "-Property Name,AdapterRAM | ConvertTo-Json -Compress"],
-            timeout=5, creationflags=flags)
-        j = _json.loads(out.decode("utf-8", "ignore") or "{}")
-        info["gpu"] = j.get("Name")
-        if j.get("AdapterRAM"):
-            info["vram_gb"] = round(int(j["AdapterRAM"]) / 1024 ** 3, 1)
+        import winreg
+        adapters = []
+        class_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, class_path) as display:
+            for index in range(winreg.QueryInfoKey(display)[0]):
+                name = winreg.EnumKey(display, index)
+                if not name.isdecimal():
+                    continue
+                with winreg.OpenKey(display, name) as adapter:
+                    try:
+                        label, _ = winreg.QueryValueEx(adapter, "DriverDesc")
+                        size, _ = winreg.QueryValueEx(adapter, "HardwareInformation.qwMemorySize")
+                    except FileNotFoundError:
+                        continue
+                    if isinstance(size, bytes) and len(size) == 8:
+                        size = int.from_bytes(size, "little")
+                    if isinstance(size, int) and 0 < size < 1024 ** 4:
+                        adapters.append((size, label))
+        if adapters:
+            size, info["gpu"] = max(adapters)
+            info["vram_gb"] = round(size / 1024 ** 3, 1)
     except Exception:
         pass
     return info
 
 
 def game_running():
-    """是否有正在运行的 left4dead2.exe。"""
+    """Treat an unavailable process check as potentially running."""
     try:
-        return bool(_running_game_dirs())
-    except Exception:  # noqa
-        return False
+        if os.name == "nt":
+            return _running_game_dirs(presence_only=True) is not False
+        if sys.platform.startswith("linux"):
+            with os.scandir("/proc") as processes:
+                for entry in processes:
+                    if not entry.name.isdecimal():
+                        continue
+                    try:
+                        with open(os.path.join(entry.path, "comm"), "rb") as name:
+                            if name.read(64).strip().lower() in (
+                                    b"left4dead2_linux", b"left4dead2.exe", b"left4dead2"):
+                                return True
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+            return False
+        return True
+    except Exception:
+        return True
 
 
 def _is_l4d2_root(p):
@@ -775,18 +847,269 @@ def _norm_addon_key(k):
     return k.replace("/", "\\").strip().lower()
 
 
-def load_addonlist(addons_dir):
-    """读取 addonlist.txt -> {规范化相对路径: 是否启用}。缺失/损坏时视为全部启用。"""
-    path = addonlist_path(addons_dir)
-    out = {}
+def checked_stat(path):
+    """Check every component from the volume root, without accepting redirects."""
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent != path:
+        checked_stat(parent)
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-            text = f.read()
-    except OSError:
-        return out
-    for m in re.finditer(r'"([^"]+)"\s+"([01])"', text):
-        out[_norm_addon_key(m.group(1))] = (m.group(2) == "1")
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+        raise OSError(f"路径包含链接或重解析点: {path}")
+    return info
+
+
+@contextmanager
+def pinned_directories(*directories):
+    """On Windows, prevent ancestor renames while using a checked path."""
+    if os.name != "nt":
+        for directory in directories:
+            info = checked_stat(directory)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                raise NotADirectoryError(directory)
+        yield
+        return
+
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_directory = kernel.CreateFileW
+    open_directory.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    open_directory.restype = wintypes.HANDLE
+    close_handle = kernel.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    invalid = ctypes.c_void_p(-1).value
+    seen = set()
+    required = {os.path.normcase(os.path.abspath(path)) for path in directories}
+
+    def pin(path, stack):
+        parent = os.path.dirname(path)
+        if os.path.normcase(path) in seen:
+            return
+        if parent != path:
+            pin(parent, stack)
+        # Read attributes; allow read/write sharing while denying deletion.
+        handle = open_directory(path, 0x80, 0x3, None, 3, 0x02200000, None)
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            # Some ancestors allow attribute queries but deny opening a handle.
+            if error != 5 or os.path.normcase(path) in required:
+                raise ctypes.WinError(error, path)
+        else:
+            stack.callback(close_handle, handle)
+        info = checked_stat(path)
+        if info is None or not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(path)
+        seen.add(os.path.normcase(path))
+
+    with ExitStack() as stack:
+        for directory in directories:
+            pin(os.path.abspath(directory), stack)
+        yield
+
+
+def checked_mkdir(path, *, exist_ok=False):
+    parent = os.path.dirname(os.path.abspath(path))
+    with pinned_directories(parent):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            if not exist_ok:
+                raise
+        info = checked_stat(path)
+        if info is None or not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(path)
+
+
+def file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns) if info is not None else None
+
+
+def open_checked_binary(path):
+    info = checked_stat(path)
+    if info is None:
+        raise FileNotFoundError(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"不是普通文件: {path}")
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel.CreateFileW
+        create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create_file.restype = wintypes.HANDLE
+        # Open the named object itself so a substituted link is never followed.
+        handle = create_file(os.path.abspath(path), 0x80000000, 0x7, None, 3, 0x00200000, None)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            raise ctypes.WinError(ctypes.get_last_error(), path)
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle(handle)
+            raise
+    else:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    stream = os.fdopen(fd, "rb")
+    try:
+        current = os.fstat(stream.fileno())
+        if (not os.path.samestat(current, info) or not stat.S_ISREG(current.st_mode) or
+                getattr(current, "st_file_attributes", 0) & 0x400):
+            raise OSError(f"文件已变化: {path}")
+    except BaseException:
+        stream.close()
+        raise
+    return stream
+
+
+def read_checked(path, limit=16 * 1024 * 1024):
+    info = checked_stat(path)
+    if info is None:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"不是普通文件: {path}")
+    with open_checked_binary(path) as f:
+        if not os.path.samestat(os.fstat(f.fileno()), info):
+            raise OSError(f"文件已变化: {path}")
+        data = f.read(limit + 1)
+        if len(data) > limit:
+            raise OSError(f"文件超出大小限制: {path}")
+        if file_identity(checked_stat(path)) != file_identity(info):
+            raise OSError(f"文件已变化: {path}")
+    return data
+
+
+_local_locks = threading.local()
+
+
+@contextmanager
+def installation_lock(addons_dir, *, lock_name=".l4d2_manager.lock", blocking=True):
+    path = os.path.join(os.path.dirname(os.path.abspath(addons_dir)), lock_name)
+    key = os.path.normcase(path)
+    held = getattr(_local_locks, "held", None)
+    if held is None:
+        held = _local_locks.held = set()
+    if key in held:
+        yield True
+        return
+    info = checked_stat(path)
+    if info is not None and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+        raise OSError(f"锁文件无效: {path}")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        current = checked_stat(path)
+        if (current is None or current.st_nlink != 1 or
+                not stat.S_ISREG(current.st_mode) or
+                not os.path.samestat(current, os.fstat(fd))):
+            raise OSError(f"锁文件已变化: {path}")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(fd, mode, 1)
+            else:
+                import fcntl
+                mode = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                fcntl.flock(fd, mode)
+        except OSError as error:
+            if blocking or error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            yield False
+            return
+        current = checked_stat(path)
+        if current is None or not os.path.samestat(current, os.fstat(fd)):
+            raise OSError(f"加锁时路径已变化: {path}")
+        held.add(key)
+        try:
+            yield True
+        finally:
+            held.remove(key)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data, before_replace=None, expected=...):
+    info = checked_stat(path)
+    if info is not None and not stat.S_ISREG(info.st_mode):
+        raise OSError(f"不是普通文件: {path}")
+    parent = os.path.dirname(os.path.abspath(path))
+    parent_info = checked_stat(parent)
+    if parent_info is None:
+        raise FileNotFoundError(parent)
+    with pinned_directories(parent):
+        current = checked_stat(parent)
+        if current is None or not os.path.samestat(parent_info, current):
+            raise OSError(f"提交目录已变化: {parent}")
+        _atomic_write_pinned(path, data, before_replace, expected, info, parent, parent_info)
+
+
+def _atomic_write_pinned(path, data, before_replace, expected, info, parent, parent_info):
+    fd, tmp = tempfile.mkstemp(prefix=".l4d2-", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+            temp_info = os.fstat(f.fileno())
+        current_parent = checked_stat(parent)
+        current_temp = checked_stat(tmp)
+        if (current_parent is None or not os.path.samestat(parent_info, current_parent) or
+                current_temp is None or not os.path.samestat(current_temp, temp_info) or
+                current_temp.st_size != temp_info.st_size or
+                current_temp.st_mtime_ns != temp_info.st_mtime_ns or
+                file_identity(checked_stat(path)) !=
+                (file_identity(info) if expected is ... else expected)):
+            raise OSError(f"提交前文件已变化: {path}")
+        if before_replace is not None:
+            before_replace()
+        os.replace(tmp, path)
+    finally:
+        current = checked_stat(parent)
+        if current is not None and os.path.samestat(current, parent_info):
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+
+def _parse_addonlist(data):
+    if data is None:
+        return {}
+    text = data.decode("utf-8-sig", "surrogateescape")
+    pattern = re.compile(r'\s+|//[^\r\n]*|/\*.*?\*/|("[^"\r\n]*"|[{}]|[^\s{}/"]+)', re.S)
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        match = pattern.match(text, pos)
+        if match is None:
+            raise ValueError("addonlist.txt 格式无效")
+        pos = match.end()
+        if match[1] is not None:
+            tokens.append(match[1])
+    if (len(tokens) < 3 or tokens[0].strip('"').lower() != "addonlist" or
+            tokens[1] != "{" or tokens[-1] != "}" or len(tokens) % 2 != 1):
+        raise ValueError("addonlist.txt 结构无效")
+    out = {}
+    for key, value in zip(tokens[2:-1:2], tokens[3:-1:2]):
+        if len(key) < 2 or not key.startswith('"') or value.strip('"') not in ("0", "1"):
+            raise ValueError("addonlist.txt 条目无效")
+        key = key[1:-1]
+        out[_norm_addon_key(key)] = (key, value.strip('"') == "1")
     return out
+
+
+def load_addonlist(addons_dir):
+    """只有缺失的 addonlist 才按空表处理。"""
+    return {key: enabled for key, (_, enabled) in
+            _parse_addonlist(read_checked(addonlist_path(addons_dir))).items()}
 
 
 def addon_keys(addon, addons_dir):
@@ -836,36 +1159,43 @@ def is_addon_listed_enabled(addon, addons_dir, listed=None):
 
 def filter_enabled_by_addonlist(addons, addons_dir):
     listed = load_addonlist(addons_dir)
-    return [a for a in addons if is_addon_listed_enabled(a, addons_dir, listed)]
+    return [active for addon in addons
+            if (active := enabled_vpks(addon, addons_dir, listed)) is not None]
 
 
-def set_addonlist_entries(addons_dir, items):
-    """原子写入多个 (key, enabled),保留其它条目与原始大小写/顺序。"""
+def enabled_vpks(addon, addons_dir, listed):
+    if not addon.vpks:
+        return addon
+    active = [v for v in addon.vpks
+              if listed.get(_norm_addon_key(os.path.relpath(v.dir_path, addons_dir)), True)]
+    if not active:
+        return None
+    result = copy.copy(addon)
+    result.vpks = active
+    result.vpk = active[0]
+    return result
+
+
+def set_addonlist_entries(addons_dir, items, *, before_replace=None):
+    """串行化读改写，保留无关条目和原大小写。None 删除指定键。"""
     path = addonlist_path(addons_dir)
-    entries = {}
-    try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-            text = f.read()
-    except OSError:
-        text = ""
-    for m in re.finditer(r'"([^"]+)"\s+"([01])"', text):
-        entries[_norm_addon_key(m.group(1))] = [m.group(1), m.group(2) == "1"]
-    for k, enabled in items:
-        nk = _norm_addon_key(k)
-        if nk in entries:
-            entries[nk][1] = enabled
-        else:
-            entries[nk] = [k, enabled]
-    parts = ['"AddonList"', '{']
-    for _nk, (orig, val) in entries.items():
-        parts.append('\t"%s"\t\t"%s"' % (orig, "1" if val else "0"))
-    parts.append('}')
-    data = "\n".join(parts) + "\n"
-    tmp = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    with installation_lock(addons_dir):
+        original = file_identity(checked_stat(path))
+        entries = _parse_addonlist(read_checked(path))
+        for key, enabled in items:
+            normalized = _norm_addon_key(key)
+            if not key or any(char in key for char in '"\r\n'):
+                raise ValueError("无效的 addonlist 键")
+            if enabled is None:
+                entries.pop(normalized, None)
+            else:
+                entries[normalized] = (entries.get(normalized, (key,))[0], enabled)
+        parts = ['"AddonList"', '{']
+        parts.extend('\t"%s"\t\t"%s"' % (key, "1" if enabled else "0")
+                     for key, enabled in entries.values())
+        parts.append('}\n')
+        atomic_write(path, "\n".join(parts).encode("utf-8", "surrogateescape"),
+                     before_replace=before_replace, expected=original)
 
 
 def set_addonlist_enabled(addons_dir, keys, enabled):
@@ -881,10 +1211,23 @@ def _iter_loose_files(folder, warnings=None):
             warnings.append({"path": getattr(e, "filename", folder),
                              "error": str(e)})
 
-    for root, _dirs, files in os.walk(folder, onerror=onerror):
+    expanded = 0
+    directories_left = 10_000
+    for root, dirs, files in os.walk(folder, onerror=onerror):
+        directories_left -= len(dirs) + 1
+        if directories_left < 0:
+            onerror(OSError("松散目录超过扫描预算"))
+            return rels
+        dirs[:] = [name for name in dirs if _scan_safe(os.path.join(root, name), warnings)]
         for fn in files:
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, folder).replace("\\", "/")
+            if not _scan_safe(full, warnings):
+                continue
+            expanded += len(rel)
+            if len(rel) > Vpk.MAX_PATH_LENGTH or len(rels) >= Vpk.MAX_ENTRIES or expanded > Vpk.MAX_EXPANDED:
+                onerror(OSError("松散文件超过扫描预算"))
+                return rels
             rels.add(rel)
     return rels
 
@@ -898,13 +1241,54 @@ def _looks_like_loose_mod(folder, rels):
     return bool(tops & markers)
 
 
+def _scan_safe(path, warnings):
+    try:
+        return checked_stat(path) is not None
+    except OSError as error:
+        if warnings is not None and len(warnings) < 1000:
+            warnings.append({"path": path, "error": str(error)})
+        return False
+
+
 def discover_addons(addons_dir, verbose=False, warnings=None):
     addons = []
+    entries_left = 750_000
+    bytes_left = 96 * 1024 * 1024
+    archives = set()
+    errors = {}
+    trees_left = 128 * 1024 * 1024
+    vpks_left = 4000
+
+    def charge_tree(size):
+        nonlocal trees_left
+        trees_left -= size
+        if trees_left < 0:
+            raise VpkError("VPK 目录树总大小超出扫描上限")
+
+    def charge(count, size, path):
+        nonlocal entries_left, bytes_left
+        entries_left -= count
+        bytes_left -= size
+        if entries_left < 0 or bytes_left < 0:
+            errors[path] = "安装目录超过扫描预算"
+            return False
+        return True
 
     def load_vpk(path):
+        nonlocal vpks_left
+        if os.path.normcase(path) in archives:
+            return None
+        if entries_left <= 0 or bytes_left <= 0 or trees_left < 0 or vpks_left <= 0:
+            errors[addons_dir] = "VPK 数量或索引大小超出扫描上限"
+            return None
+        if not _scan_safe(path, warnings):
+            return None
+        vpks_left -= 1
         try:
-            v = Vpk(path)
-        except VpkError as e:
+            v = Vpk(path, charge_tree=charge_tree)
+        except (VpkError, OSError) as e:
+            if len(errors) < 1000:
+                errors[path] = str(e)
             if verbose:
                 print(f"  [跳过] {path}: {e}")
             return None
@@ -912,11 +1296,23 @@ def discover_addons(addons_dir, verbose=False, warnings=None):
             if verbose:
                 print(f"  [空] {path}")
             return None
+        archives.update(map(os.path.normcase, v.archive_paths))
+        if not charge(len(v.entries), sum(len(p) + len(e.preload) for p, e in v.entries.items()), path):
+            return None
         return v
 
     def safe_listdir(path):
         try:
-            return sorted(os.listdir(path))
+            if not _scan_safe(path, warnings):
+                return []
+            with os.scandir(path) as entries:
+                names = []
+                for entry in entries:
+                    if len(names) >= 10_000:
+                        errors[path] = "目录成员超过扫描预算"
+                        break
+                    names.append(entry.name)
+            return sorted(names)
         except OSError as e:
             if verbose:
                 print(f"  [无法读取] {path}: {e}")
@@ -926,11 +1322,13 @@ def discover_addons(addons_dir, verbose=False, warnings=None):
 
     # 1) 创意工坊
     ws = os.path.join(addons_dir, "workshop")
-    if os.path.isdir(ws):
+    if _scan_safe(ws, warnings) and os.path.isdir(ws):
         if verbose:
             print(f"扫描创意工坊目录: {ws}")
         for entry in safe_listdir(ws):
             full = os.path.join(ws, entry)
+            if not _scan_safe(full, warnings):
+                continue
             if os.path.isdir(full):
                 # 结构 A: addons/workshop/<id>/<file>.vpk —— 整个目录是一个物理单元
                 cid = entry
@@ -951,6 +1349,7 @@ def discover_addons(addons_dir, verbose=False, warnings=None):
                     a = Addon(f"workshop:{cid}", "创意工坊", "workshop",
                               vpks[0].dir_path, vpk=vpks[0], title=title)
                     a.vpks = vpks
+                    a.unit_path = full
                     a.workshop_id = cid if cid.isdigit() else None
                     addons.append(a)
                 elif verbose:
@@ -977,6 +1376,8 @@ def discover_addons(addons_dir, verbose=False, warnings=None):
     # 2) 手动安装: addons/*.vpk
     for fn in safe_listdir(addons_dir):
         full = os.path.join(addons_dir, fn)
+        if not _scan_safe(full, warnings):
+            continue
         if os.path.isfile(full) and fn.lower().endswith(".vpk"):
             v = load_vpk(full)
             if v is None:
@@ -987,10 +1388,15 @@ def discover_addons(addons_dir, verbose=False, warnings=None):
     # 3) 松散文件夹模组
     for fn in safe_listdir(addons_dir):
         full = os.path.join(addons_dir, fn)
+        if not _scan_safe(full, warnings):
+            continue
         if not os.path.isdir(full) or fn.lower() == "workshop":
             continue
+        if entries_left <= 0 or bytes_left <= 0:
+            errors[addons_dir] = "松散文件目录大小超出扫描上限"
+            break
         rels = _iter_loose_files(full, warnings)
-        if rels and _looks_like_loose_mod(full, rels):
+        if rels and charge(len(rels), sum(map(len, rels)), full) and _looks_like_loose_mod(full, rels):
             addons.append(Addon(
                 uid=f"loose:{os.path.normpath(full)}",
                 source="松散文件夹",
@@ -1000,7 +1406,22 @@ def discover_addons(addons_dir, verbose=False, warnings=None):
                 title=os.path.basename(full),
             ))
 
-    return addons
+    result = []
+    for addon in addons:
+        if addon.vpks:
+            packages = [v for v in addon.vpks if os.path.normcase(v.dir_path) not in archives]
+            if not packages:
+                continue
+            if packages[0] is not addon.vpk:
+                addon.vpk = packages[0]
+                addon.location = packages[0].dir_path
+                addon.title = read_addon_title(packages[0])
+            addon.vpks = packages
+        result.append(addon)
+    if warnings is not None:
+        warnings.extend({"path": path, "error": error} for path, error in errors.items()
+                        if os.path.normcase(path) not in archives)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1118,97 +1539,109 @@ def annotate_target(paths):
     return "  ".join(parts)
 
 
-def build_base_index(game_dir):
-    """解析游戏本体 pak01_dir.vpk,返回 {小写路径: (crc,length)}。失败返回 None。"""
-    path = os.path.join(game_dir, "pak01_dir.vpk")
+def base_package_paths(game_dir):
+    folders = [game_dir]
     try:
-        v = Vpk(path)
-    except (VpkError, OSError):
-        return None
-    return {k.lower(): (e.crc, e.length) for k, e in v.entries.items()}
+        with os.scandir(os.path.dirname(game_dir)) as entries:
+            folders.extend(e.path for e in entries
+                           if re.fullmatch(r"left4dead2_(?:dlc\d+|update)", e.name, re.I))
+    except OSError:
+        pass
+    return [os.path.join(folder, "pak01_dir.vpk") for folder in sorted(folders)]
 
 
-def _addon_entry(addon, key_lower):
-    for v in getattr(addon, "vpks", []) or []:
-        k = v.find(key_lower)
-        if k:
-            return v.entries[k]
-    return None
+def build_base_index(game_dir):
+    """Index the base package and official update packages conservatively."""
+    index = {}
+    paths = base_package_paths(game_dir)
+    for path in paths:
+        try:
+            package = Vpk(path)
+        except (VpkError, OSError):
+            continue
+        for key, entry in package.entries.items():
+            key = key.lower()
+            signature = (entry.crc, len(entry.preload) + entry.length)
+            index[key] = signature if index.get(key, signature) == signature else None
+    return index or None
+
+
+def physical_id(addon):
+    return os.path.normcase(os.path.abspath(getattr(addon, "unit_path", addon.location)))
+
+
+def _signature(addon, key):
+    signatures = set()
+    for package in addon.vpks:
+        path = package.find(key)
+        if path is not None:
+            entry = package.entries[path]
+            signatures.add((entry.crc, len(entry.preload) + entry.length))
+    return next(iter(signatures)) if len(signatures) == 1 else None
+
+
+class ConflictMap(dict):
+    def __init__(self):
+        super().__init__()
+        self.pairs = defaultdict(int)
 
 
 def analyze(addons, include_meta=False, ignore_scripts=True, base_index=None,
             stats=None, skip_identical=True, skip_base=True):
-    """返回 (path_map, conflicts)。
-    path_map: 规范化小写路径 -> [(原样路径, addon), ...]
-    conflicts: 规范化小写路径 -> [(原样路径, addon), ...]  (仅 >=2 个不同 addon)
-    """
-    path_map = defaultdict(list)
+    """Return paths and the physical providers participating in each conflict."""
+    stats = {} if stats is None else stats
+    stats.update(scripts=0, identical=0, base=0)
+    paths = defaultdict(list)
     for addon in addons:
-        for p in addon.paths():
-            base = p.rsplit("/", 1)[-1].lower()
-            if not include_meta:
-                if base.endswith(".cache"):
-                    continue
-                if "/" not in p and base in META_BASENAMES:
-                    continue
-            path_map[p.lower()].append((p, addon))
-
-    if stats is not None:
-        stats.setdefault("scripts", 0)
-        stats.setdefault("identical", 0)
-        stats.setdefault("base", 0)
-
-    conflicts = {}
-    for key, lst in path_map.items():
-        uids = {a.uid for _p, a in lst}
-        if len(uids) < 2:
-            continue
-
-        vals = []
-        for _p, a in lst:
-            e = _addon_entry(a, key)
-            if e is not None:
-                vals.append((e.crc, e.length))
-
-        # 1) 所有提供者内容完全相同 -> 不是冲突
-        if skip_identical and vals and len(set(vals)) == 1:
-            if stats is not None:
-                stats["identical"] += 1
-            continue
-
-        # 2) 所有提供者都与游戏本体相同 -> 无实际改变,不是冲突
-        if skip_base and base_index is not None and vals:
-            bv = base_index.get(key)
-            if bv is not None and all(v == bv for v in vals):
-                if stats is not None:
-                    stats["base"] += 1
+        for path in sorted(addon.paths()):
+            base = path.rsplit("/", 1)[-1].lower()
+            if not include_meta and (base.endswith(".cache") or
+                                     ("/" not in path and base in META_BASENAMES)):
                 continue
+            paths[path.lower()].append((path, addon))
 
-        # 3) 脚本类默认不算冲突(可通过 --include-scripts / 界面开关显示)
-        if ignore_scripts and key.startswith("scripts/"):
-            if stats is not None:
-                stats["scripts"] += 1
+    conflicts = ConflictMap()
+    pair_budget = 250_000
+    providers_left = 15_000
+    for key, providers in paths.items():
+        unique = {physical_id(addon): (path, addon) for path, addon in providers}
+        if len(unique) < 2:
             continue
-
-        conflicts[key] = lst
-    return path_map, conflicts
+        if ignore_scripts and key.startswith("scripts/"):
+            stats["scripts"] += 1
+            continue
+        ids = sorted(unique)
+        pair_budget -= len(ids) * (len(ids) - 1) // 2
+        if pair_budget < 0 or len(conflicts) >= 5000 or providers_left < len(ids):
+            stats["truncated"] = True
+            break
+        if len(ids) > 100:
+            stats["truncated"] = True
+            continue
+        signatures = ({uid: _signature(unique[uid][1], key) for uid in ids}
+                      if skip_identical or skip_base else dict.fromkeys(ids))
+        base = base_index.get(key) if base_index else None
+        involved = set()
+        ignored = set()
+        for left, right in combinations(ids, 2):
+            first, second = signatures[left], signatures[right]
+            if skip_base and base is not None and first == second == base:
+                ignored.add("base")
+            elif skip_identical and first is not None and first == second:
+                ignored.add("identical")
+            else:
+                conflicts.pairs[left, right] += 1
+                involved.update((left, right))
+        for reason in ignored:
+            stats[reason] += 1
+        if involved:
+            providers_left -= len(involved)
+            conflicts[key] = [unique[uid] for uid in ids if uid in involved]
+    return paths, conflicts
 
 
 def build_pair_summary(conflicts):
-    """统计每一对模组之间有多少个冲突文件。"""
-    pair_count = defaultdict(int)
-    for _key, lst in conflicts.items():
-        # 去重同一 addon
-        by_uid = {}
-        for _p, a in lst:
-            by_uid.setdefault(a.uid, a)
-        uid_list = list(by_uid.values())
-        for i in range(len(uid_list)):
-            for j in range(i + 1, len(uid_list)):
-                a, b = uid_list[i], uid_list[j]
-                pair = tuple(sorted((a.uid, b.uid)))
-                pair_count[pair] += 1
-    return pair_count
+    return conflicts.pairs
 
 
 # ---------------------------------------------------------------------------
@@ -1241,7 +1674,7 @@ def report_console(addons, conflicts, pair_count, min_files=1, max_files=200):
     # --- 模组对汇总 ---
     shown_pairs = [(p, c) for p, c in pair_count.items() if c >= min_files]
     shown_pairs.sort(key=lambda x: (-x[1], x[0]))
-    uid2addon = {a.uid: a for a in addons}
+    uid2addon = {physical_id(a): a for a in addons}
     if shown_pairs:
         print("【模组对汇总】冲突文件数从多到少:")
         for (u1, u2), cnt in shown_pairs:
@@ -1268,20 +1701,21 @@ def report_console(addons, conflicts, pair_count, min_files=1, max_files=200):
         # 去重 addon
         seen = set()
         for _p, a in lst:
-            if a.uid in seen:
+            if physical_id(a) in seen:
                 continue
-            seen.add(a.uid)
+            seen.add(physical_id(a))
             print(f"      · {a.display_name}")
             print(f"          位置: {a.location}")
         print()
 
 
-def report_json(path, addons, conflicts, pair_count):
-    uid2addon = {a.uid: a for a in addons}
+def report_json(path, addons, conflicts, pair_count, warnings=()):
+    uid2addon = {physical_id(a): a for a in addons}
     data = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "addon_count": len(addons),
         "conflict_count": len(conflicts),
+        "warnings": list(warnings),
         "addons": [
             {
                 "uid": a.uid,
@@ -1326,9 +1760,9 @@ def report_json(path, addons, conflicts, pair_count):
 def _dedup_addons(lst):
     seen, out = set(), []
     for _p, a in lst:
-        if a.uid in seen:
+        if physical_id(a) in seen:
             continue
-        seen.add(a.uid)
+        seen.add(physical_id(a))
         out.append(a)
     return out
 
@@ -1339,7 +1773,7 @@ def _html_escape(s):
 
 
 def report_html(path, addons, conflicts, pair_count, min_files=1):
-    uid2addon = {a.uid: a for a in addons}
+    uid2addon = {physical_id(a): a for a in addons}
     gen = time.strftime("%Y-%m-%d %H:%M:%S")
     parts = []
     parts.append("""<!DOCTYPE html>
@@ -1444,20 +1878,23 @@ def run_once(args):
     print(f"模组目录: {addons_dir}")
     print()
 
-    addons = discover_addons(addons_dir, verbose=args.verbose)
+    warnings = []
+    addons = discover_addons(addons_dir, verbose=args.verbose, warnings=warnings)
+    for item in warnings:
+        print(f"扫描警告: {item['path']}: {item['error']}", file=sys.stderr)
     addons = filter_enabled_by_addonlist(addons, addons_dir)
     if not addons:
         print("未在 addons 目录中找到任何 VPK / 松散模组。")
         print("(如果你还没订阅或安装模组,这是正常的。)")
         if args.json:
-            report_json(args.json, [], {}, {})
+            report_json(args.json, [], {}, {}, warnings)
             print(f"已写出 JSON: {args.json}")
         if args.html:
             report_html(args.html, [], {}, {})
             print(f"已写出 HTML: {args.html}")
         return 0
 
-    base_index = build_base_index(os.path.dirname(addons_dir))
+    base_index = None if args.strict else build_base_index(os.path.dirname(addons_dir))
     stats = {}
     _path_map, conflicts = analyze(
         addons, include_meta=args.include_meta,
@@ -1469,12 +1906,17 @@ def run_once(args):
               f"{stats.get('identical', 0)} 处内容相同、"
               f"{stats.get('base', 0)} 处与本体相同的冲突")
     pair_count = build_pair_summary(conflicts)
+    if stats.get("truncated") or len(pair_count) > 1000:
+        message = "冲突配对或输出达到扫描上限"
+        warnings.append({"path": addons_dir, "error": message})
+        print(f"扫描警告: {message}", file=sys.stderr)
+        pair_count = dict(sorted(pair_count.items(), key=lambda item: -item[1])[:1000])
 
     report_console(addons, conflicts, pair_count,
                    min_files=args.min_files, max_files=args.max_files)
 
     if args.json:
-        report_json(args.json, addons, conflicts, pair_count)
+        report_json(args.json, addons, conflicts, pair_count, warnings)
         print(f"已写出 JSON 报告: {args.json}")
     if args.html:
         report_html(args.html, addons, conflicts, pair_count, min_files=args.min_files)
@@ -1575,7 +2017,7 @@ def build_argparser():
     p.add_argument("--max-files", type=int, default=200, metavar="N",
                    help="控制台最多显示多少条冲突明细 (默认 200,HTML 报告不受限)")
     p.add_argument("--strict", action="store_true",
-                   help="严格模式:按文件路径判冲突(含脚本/内容相同),接近游戏本体")
+                   help="严格模式:按路径判冲突(含脚本及相同内容，默认排除 .cache 和根级元信息)")
     p.add_argument("--include-scripts", action="store_true",
                    help="把 scripts/ 类冲突也计入(默认忽略,视为不影响游戏)")
     p.add_argument("--include-meta", action="store_true",

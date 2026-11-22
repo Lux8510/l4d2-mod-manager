@@ -136,7 +136,6 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 </script><script>/* L4D2 模组管理器 · 前端交互(无框架,配合本地 Tailwind 构建) */
 let STATE = null;
 let TAB = 'conf';
-let BYUID = {};
 
 const CAT_ORDER = ["武器", "角色", "声音", "界面", "地图", "特效", "模型", "材质", "脚本", "其他"];
 const TOKEN = window.__L4D2_TOKEN__ || '';
@@ -179,7 +178,9 @@ function toast(msg, err) {
   }, 2600);
 }
 
+let closeCurrentModal;
 function showModal(opts) {
+  if (closeCurrentModal) closeCurrentModal();
   const m = $('modal');
   m.innerHTML = `
     <div class="modal-backdrop"></div>
@@ -194,15 +195,20 @@ function showModal(opts) {
     </div>`;
   m.classList.remove('hidden');
   const prevFocus = document.activeElement;
-  requestAnimationFrame(() => m.classList.add('show'));
-
   const close = () => {
+    if (closeCurrentModal !== close) return;
+    closeCurrentModal = null;
     m.classList.remove('show');
-    setTimeout(() => {
-      m.classList.add('hidden'); m.innerHTML = '';
-      if (prevFocus && prevFocus.focus) { try { prevFocus.focus(); } catch (e) {} }
-    }, 200);
+    m.classList.add('hidden');
+    m.innerHTML = '';
+    if (prevFocus && prevFocus.isConnected) prevFocus.focus();
   };
+  closeCurrentModal = close;
+  requestAnimationFrame(() => {
+    if (closeCurrentModal !== close) return;
+    m.classList.add('show');
+    m.querySelector('input, [data-modal-cancel]').focus();
+  });
   m.onkeydown = (ev) => {
     if (ev.key !== 'Tab') return;
     const f = [...m.querySelectorAll('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])')]
@@ -226,10 +232,6 @@ function showModal(opts) {
     close();
     if (opts.onConfirm) opts.onConfirm();
   };
-  setTimeout(() => {
-    const f = m.querySelector('[data-modal-ok]') || m.querySelector('input,button');
-    if (f) { try { f.focus(); } catch (e) {} }
-  }, 60);
 }
 
 /* ---------------- 数字滚动 ---------------- */
@@ -239,7 +241,9 @@ function countTo(id, to) {
   const from = parseInt(el.textContent, 10);
   if (reduceMotion || isNaN(from) || from === to) { el.textContent = to; return; }
   const t0 = performance.now(), dur = 620;
+  const generation = scanGeneration;
   function step(t) {
+    if (generation !== scanGeneration) return;
     const p = Math.min(1, (t - t0) / dur);
     const e = 1 - Math.pow(1 - p, 3);
     el.textContent = Math.round(from + (to - from) * e);
@@ -249,11 +253,13 @@ function countTo(id, to) {
 }
 
 /* ---------------- 扫描 ---------------- */
+let scanGeneration = 0;
 async function scan() {
+  const generation = ++scanGeneration;
   const btn = $('scanBtn'), bar = $('progress');
   const dot = $('statusDot'), st = $('statusText');
   if (bar) bar.classList.add('on');
-  if (btn) { btn.disabled = true; btn.dataset.old = btn.textContent; btn.textContent = '扫描中…'; }
+  if (btn) { btn.disabled = true; btn.dataset.old ||= btn.textContent; btn.textContent = '扫描中…'; }
   if (dot) dot.classList.add('dot-busy');
   if (st) st.textContent = '扫描中…';
   try {
@@ -262,12 +268,18 @@ async function scan() {
     const params = [];
     if (showScripts && showScripts.checked) params.push('include_scripts=1');
     if (strictEl && strictEl.checked) params.push('strict=1');
-    const r = await api('/api/scan' + (params.length ? '?' + params.join('&') : ''));
+    const url = '/api/scan' + (params.length ? '?' + params.join('&') : '');
+    let r;
+    do {
+      r = await api(url);
+      if (generation !== scanGeneration) return;
+      if (r.status === 503) await new Promise(resolve => setTimeout(resolve, 350));
+    } while (r.status === 503 && generation === scanGeneration);
+    if (generation !== scanGeneration) return;
     const j = await r.json();
+    if (generation !== scanGeneration) return;
     if (!j.ok) throw new Error(j.error || '扫描失败');
     STATE = j.data;
-    BYUID = {};
-    STATE.addons.forEach(a => { BYUID[a.uid] = a; });
     $('gamepath').textContent = STATE.game_dir;
     $('gamepath').title = STATE.addons_dir;
     countTo('s_enabled', STATE.summary.enabled);
@@ -282,12 +294,16 @@ async function scan() {
         : (STATE.sync_pending ? '待应用 ' + STATE.sync_pending + ' 项(退出游戏后生效)'
         : (STATE.game_running ? '游戏运行中' : '就绪')));
     }
-    if (STATE.incomplete) toast('有 ' + (STATE.warnings || []).length + ' 项无法读取,扫描结果可能不完整', true);
+    const warnings = STATE.warnings || [];
+    if (st) st.title = warnings.map(item => item.path + ' · ' + item.error).join('\n');
+    if (STATE.incomplete && warnings.length) toast('扫描不完整 · ' + warnings[0].error, true);
     if (STATE.pending || STATE.sync_pending) schedulePendingPoll();
   } catch (e) {
+    if (generation !== scanGeneration) return;
     toast(e.message, true);
     if (st) st.textContent = '扫描出错';
   } finally {
+    if (generation !== scanGeneration) return;
     if (bar) bar.classList.remove('on');
     if (btn) { btn.disabled = false; if (btn.dataset.old) btn.textContent = btn.dataset.old; }
     if (dot) dot.classList.remove('dot-busy');
@@ -329,30 +345,41 @@ function currentRows() {
 
 /* ---------------- 设备/负载 ---------------- */
 function confirmDisableAll() {
+  if (!STATE) return;
+  const confirmed = STATE.disable_plan;
+  const count = Object.values(confirmed).reduce((total, item) => total + item.keys.length, 0);
   showModal({
     title: '禁用全部模组',
-    desc: '将把所有模组写入 addonlist 为关闭(0 启用),可逆。继续?',
+    desc: '将关闭已识别的 ' + count + ' 个 VPK，操作可逆。松散文件夹请用各自的开关隔离。继续？',
     confirmText: '全部禁用',
-    onConfirm: () => doAction('disable_all', {}),
+    onConfirm: () => doAction('disable_all', { confirmed }),
   });
 }
 
 function confirmRemoveAll() {
+  const confirmed = STATE && STATE.removal_plan;
+  if (!confirmed) { toast('无法取得安全的移除清单，请重新扫描', true); return; }
+  const names = Object.keys(confirmed);
+  if (!names.length) { toast('没有可移除的本地模组'); return; }
   showModal({
     title: '移除本地模组',
-    desc: '将把工坊 VPK 移到 _manager_backup 备份,并清空 addonlist。Steam 仍订阅,下次启动可能重新下载;要彻底取消请用「我的订阅」。继续?',
+    desc: '将把以下项目移到 _manager_backup（workshop 包含整个目录）。'
+      + 'Steam 仍订阅，重新下载后已识别的 VPK 仍为禁用。\n\n' + names.join('\n'),
     confirmText: '移除本地',
     danger: true,
-    onConfirm: () => doAction('remove_all', {}),
+    onConfirm: () => doAction('remove_all', { confirmed }),
   });
 }
 
 function confirmUnlisted() {
+  if (!STATE) return;
+  const confirmed = STATE.unlisted_plan;
+  const count = Object.values(confirmed).reduce((total, item) => total + item.keys.length, 0);
   showModal({
     title: '禁用未登记 VPK',
-    desc: '游戏会把未写入 addonlist 的 VPK 默认加载,这可能是卡顿/报错的来源。将显式禁用这些 VPK,可逆。继续?',
+    desc: '将显式禁用 ' + count + ' 个未写入 addonlist 的 VPK，操作可逆。继续？',
     confirmText: '禁用',
-    onConfirm: () => doAction('disable_unlisted', {}),
+    onConfirm: () => doAction('disable_unlisted', { confirmed }),
   });
 }
 
@@ -362,13 +389,23 @@ function renderDevice() {
   if (!el) return;
   const color = l.level === 'risk' ? '#ff6f6f' : (l.level === 'warn' ? '#ffd166' : '#54e39a');
   const label = l.level === 'risk' ? '高负载' : (l.level === 'warn' ? '偏高' : '正常');
-  let html = '内存 ' + (d.ram_avail_gb == null ? '?' : d.ram_avail_gb) + '/' + (d.ram_total_gb == null ? '?' : d.ram_total_gb)
-    + ' GB · 显存 ' + (d.vram_gb == null ? '?' : d.vram_gb) + ' GB · CPU ' + (d.cpu || '?') + ' 核<br>'
-    + '已启用 ' + (l.mods || 0) + ' 个 · ' + (l.size_gb || 0) + ' GB · ' + (l.files || 0) + ' 文件 · '
-    + '<span style="color:' + color + '">' + label + '</span>';
-  const warn = (l.warnings || []).concat(h || []);
-  if (warn.length) html += '<br><span style="color:#ffd166">' + esc(warn[0]) + '</span>';
-  el.innerHTML = html;
+  const line = document.createTextNode(
+    '内存 ' + (d.ram_avail_gb ?? '?') + '/' + (d.ram_total_gb ?? '?')
+    + ' GB · 显存 ' + (d.vram_gb ?? '?') + ' GB · CPU ' + (d.cpu || '?') + ' 核');
+  const totals = document.createTextNode(
+    '已启用 ' + (l.mods || 0) + ' 个 · ' + (l.size_gb || 0) + ' GB · '
+    + (l.files || 0) + ' 文件 · ');
+  const level = document.createElement('span');
+  level.style.color = color;
+  level.textContent = label;
+  el.replaceChildren(line, document.createElement('br'), totals, level);
+  const warn = (l.warnings || []).concat(h);
+  if (warn.length) {
+    const warning = document.createElement('span');
+    warning.style.color = '#ffd166';
+    warning.textContent = warn[0];
+    el.append(document.createElement('br'), warning);
+  }
   el.title = warn.join(String.fromCharCode(10));
 }
 
@@ -441,7 +478,7 @@ function renderConf(rows) {
   const igN = (ig.scripts || 0) + (ig.identical || 0) + (ig.base || 0);
   document.getElementById('count').textContent = groups.length + ' 组 / ' + rows.length + ' 处冲突'
     + (STATE.strict ? ' · 严格' : ' · 智能') + (igN ? ' · 已忽略 ' + igN : '');
-  document.getElementById('count').title = '智能 ' + (STATE.smart_conflicts || 0) + ' 处 / 严格 ' + (STATE.strict_conflicts || 0) + ' 处'
+  document.getElementById('count').title = (STATE.strict ? '严格' : '智能') + '模式，忽略 .cache 与根级模组元信息'
     + ' | 已忽略: 脚本 ' + (ig.scripts || 0) + ' / 内容相同 ' + (ig.identical || 0) + ' / 与本体相同 ' + (ig.base || 0);
 
   listEl.innerHTML = groups.map((g, gi) => {
@@ -564,7 +601,18 @@ async function enqueue(target, unitId, version) {
 }
 
 /* ---------------- 操作 ---------------- */
+const unitRequests = new Set();
 async function doAction(action, payload, onFail) {
+  const confirmedUnits = (action === 'disable_all' || action === 'disable_unlisted')
+    && payload.confirmed;
+  const versions = payload && payload.versions || confirmedUnits;
+  const units = versions ? Object.keys(versions)
+    : payload && payload.unit_id && action !== 'open_folder' ? [payload.unit_id] : [];
+  if (units.some(unit => unitRequests.has(unit))) {
+    if (onFail) onFail();
+    return;
+  }
+  units.forEach(unit => unitRequests.add(unit));
   const body = Object.assign({ action }, payload || {});
   try {
     const r = await api('/api/action', {
@@ -572,7 +620,8 @@ async function doAction(action, payload, onFail) {
     });
     const j = await r.json();
     toast(j.message || j.error || '完成', !j.ok);
-    if (!j.ok && j.code === 'game_running' && payload && payload.unit_id) {
+    if (!j.ok && j.code === 'game_running' && payload && payload.unit_id &&
+        (action === 'disable' || action === 'delete')) {
       if (onFail) onFail();
       showModal({
         title: '游戏正在运行',
@@ -584,14 +633,16 @@ async function doAction(action, payload, onFail) {
     }
     if (j.ok) {
       if (action === 'open_workshop' || action === 'open_folder' || action === 'open_disabled' || action === 'open_subscriptions') return;
-      scan();
+      await scan();
     } else {
-      if (r.status === 409) scan();
+      if (r.status === 409) await scan();
       if (onFail) onFail();
     }
   } catch (e) {
     toast('请求失败: ' + e.message, true);
     if (onFail) onFail();
+  } finally {
+    units.forEach(unit => unitRequests.delete(unit));
   }
 }
 
@@ -605,36 +656,10 @@ function keepOnlyGroup(gi, keepUnit) {
     title: '只保留此模组',
     desc: `将关闭以下 ${others.length} 个模组(可逆):\n\n${names}`,
     confirmText: '关闭其余',
-    onConfirm: async () => {
-      const failures = [];
-      const queued = [];
-      try {
-        for (const o of others) {
-          try {
-            const r = await api('/api/action', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ action: 'disable', unit_id: o.unit_id || o.uid, version: o.version || '' }),
-            });
-            const j = await r.json();
-            if (!j.ok) {
-              if (j.code === 'game_running') {
-                const q = await enqueueSilent('disable', o.unit_id || o.uid, o.version || '');
-                if (q.ok) queued.push(o.display_name);
-                else failures.push(o.display_name + ':' + (q.error || '失败'));
-              } else {
-                failures.push(o.display_name + ':' + (j.error || '失败'));
-              }
-            }
-          } catch (err) {
-            failures.push(o.display_name + ':' + err.message);
-          }
-        }
-      } finally {
-        await scan();
-      }
-      if (queued.length) toast('游戏运行中,已加入待处理: ' + queued.join('、'), false);
-      if (failures.length) toast(failures.join('\n'), true);
-    },
+    onConfirm: () => doAction('keep_only', {
+      keep: keepUnit,
+      versions: Object.fromEntries(g.addons.map(a => [a.unit_id, a.version])),
+    }),
   });
 }
 
@@ -661,8 +686,11 @@ document.addEventListener('change', e => {
   const enable = cb.checked;
   const row = cb.closest('.flex');
   if (row) row.classList.add('opacity-60');
+  cb.disabled = true;
   doAction(enable ? 'enable' : 'disable', { unit_id: unit, version: ver }, () => {
     cb.checked = !enable;
+  }).finally(() => {
+    cb.disabled = false;
     if (row) row.classList.remove('opacity-60');
   });
 });
@@ -695,13 +723,7 @@ function switchTab(t) {
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    const m = $('modal');
-    if (m && !m.classList.contains('hidden')) {
-      m.classList.remove('show');
-      setTimeout(() => { m.classList.add('hidden'); m.innerHTML = ''; }, 200);
-    }
-  }
+  if (e.key === 'Escape' && closeCurrentModal) closeCurrentModal();
 });
 
 /* ---------------- Three.js 背景(极淡氛围) ---------------- */

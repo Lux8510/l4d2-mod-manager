@@ -118,11 +118,6 @@ def pick_among(paths):
         return paths[0]
 
 
-def _page_bundled():
-    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
-    return os.path.isfile(os.path.join(base, "page.html"))
-
-
 def _tk_available():
     try:
         import tkinter  # noqa
@@ -150,6 +145,8 @@ def run_selftest(game_dir=None):
         if not addons:
             result = {"ok": False, "error": "找不到游戏目录"}
         else:
+            if "%%L4D2_TOKEN%%" not in dash.load_page_html():
+                raise ValueError("page.html 缺少授权标记")
             mgr = dash.Manager(addons)
             st = mgr.state()
             result = {
@@ -158,7 +155,7 @@ def run_selftest(game_dir=None):
                 "summary": st["summary"],
                 "webview_available": _webview_available(),
                 "tkinter_available": _tk_available(),
-                "page_bundled": _page_bundled(),
+                "page_bundled": True,
             }
     except Exception as e:  # noqa
         result = {"ok": False, "error": repr(e)}
@@ -180,6 +177,37 @@ def _webview_available():
         return False
 
 
+def _webview2_available():
+    if os.name != "nt":
+        return False
+    import winreg
+    path = r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    for hive, view in ((winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+                       (winreg.HKEY_CURRENT_USER, 0)):
+        try:
+            with winreg.OpenKey(hive, path, 0, winreg.KEY_READ | view) as key:
+                version, _ = winreg.QueryValueEx(key, "pv")
+            if isinstance(version, str) and version.strip() not in ("", "0.0.0.0"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _wait_for_browser_close():
+    try:
+        import tkinter as tk
+        window = tk.Tk()
+    except Exception:
+        print("按 Ctrl+C 停止本地服务。")
+        threading.Event().wait()
+        return
+    window.title("L4D2 模组管理器")
+    tk.Label(window, text="管理界面已在浏览器中打开。").pack(padx=24, pady=12)
+    tk.Button(window, text="关闭本地服务", command=window.destroy).pack(pady=(0, 12))
+    window.mainloop()
+
+
 def main(argv=None):
     try:
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -192,6 +220,7 @@ def main(argv=None):
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--apply-on-exit", action="store_true",
                    help=argparse.SUPPRESS)
+    p.add_argument("--install-identity", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     if args.selftest:
@@ -199,19 +228,10 @@ def main(argv=None):
 
     if args.apply_on_exit:
         import l4d2_dashboard as dash
-        addons = resolve_addons_dir(args.game_dir)
-        if not addons:
-            for game in core.find_l4d2_dirs():
-                cand = os.path.join(game, "left4dead2", "addons")
-                if _addons_ok(cand):
-                    addons = cand
-                    break
-        if addons:
-            try:
-                dash.apply_on_exit(addons)
-            except Exception:  # noqa
-                pass
-        return 0
+        addons = args.game_dir
+        if not addons or not _addons_ok(addons):
+            return 2
+        return dash.apply_on_exit(addons, args.install_identity)
 
     addons = None
     if args.game_dir:
@@ -242,23 +262,22 @@ def main(argv=None):
         except Exception:
             webview = None
 
-        if webview is not None:
+        if webview is not None and (os.name != "nt" or _webview2_available()):
             try:
                 webview.create_window(
                     "L4D2 模组管理器", url,
                     width=1200, height=800, min_size=(900, 600),
                     background_color="#0a0c11",
                 )
-                webview.start()
+                webview.start(gui="edgechromium" if os.name == "nt" else None)
                 return 0
             except Exception as e:  # noqa
                 print(f"WebView 启动失败,回退到浏览器: {e}", file=sys.stderr)
 
         # 回退:默认浏览器打开,保持服务运行
-        webbrowser.open(url)
-        print("已在浏览器中打开。关闭本程序即可停止服务。")
-        while True:
-            threading.Event().wait(1)
+        if not webbrowser.open(url):
+            show_error(f"无法打开默认浏览器。可手动访问 {url}")
+        _wait_for_browser_close()
     except KeyboardInterrupt:
         pass
     finally:
