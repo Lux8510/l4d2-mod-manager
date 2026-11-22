@@ -785,7 +785,7 @@ class Manager:
 
     def open_subscriptions(self):
         return self._open(
-            "https://steamcommunity.com/my/myworkshopfiles/?appid=550&browsefilter=mysubscriptions")
+            "steam://openurl/https://steamcommunity.com/my/myworkshopfiles/?appid=550&browsefilter=mysubscriptions")
 
     def enable(self, unit_id, version):
         with self.lock:
