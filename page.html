@@ -86,12 +86,14 @@
         <p class="mt-2 text-[12px] leading-relaxed text-muted">
           右侧开关直接启用 / 关闭模组,与游戏内「附加组件」同一份状态;游戏运行时的改动会在退出后自动应用。
         </p>
+        <div id="device-info" class="mt-3 text-[11px]" style="border-top:1px solid rgba(255,255,255,.12);padding-top:10px"></div>
         <div class="mt-auto pt-4">
           <button class="btn btn-primary" style="width:100%" onclick="doAction('apply_and_launch',{})">应用并启动游戏</button>
           <div class="grid grid-cols-2 gap-2" style="padding-top:8px">
             <button class="btn" onclick="scan()">刷新数据</button>
             <button class="btn btn-ghost" onclick="doAction('open_disabled',{})">打开隔离区</button>
           </div>
+          <button class="btn" style="width:100%;margin-top:8px" onclick="confirmUnlisted()">禁用未登记 VPK</button>
         </div>
       </div>
     </section>
@@ -318,6 +320,32 @@ function currentRows() {
     return (a.display_name + ' ' + a.location + ' ' + (a.workshop_id || '') + ' ' + a.category + ' ' + (a.target || ''))
       .toLowerCase().includes(q);
   });
+}
+
+/* ---------------- 设备/负载 ---------------- */
+function confirmUnlisted() {
+  showModal({
+    title: '禁用未登记 VPK',
+    desc: '游戏会把未写入 addonlist 的 VPK 默认加载,这可能是卡顿/报错的来源。将显式禁用这些 VPK,可逆。继续?',
+    confirmText: '禁用',
+    onConfirm: () => doAction('disable_unlisted', {}),
+  });
+}
+
+function renderDevice() {
+  const d = STATE.device || {}, l = STATE.load || {}, h = (STATE.health || []);
+  const el = document.getElementById('device-info');
+  if (!el) return;
+  const color = l.level === 'risk' ? '#ff6f6f' : (l.level === 'warn' ? '#ffd166' : '#54e39a');
+  const label = l.level === 'risk' ? '高负载' : (l.level === 'warn' ? '偏高' : '正常');
+  let html = '内存 ' + (d.ram_avail_gb == null ? '?' : d.ram_avail_gb) + '/' + (d.ram_total_gb == null ? '?' : d.ram_total_gb)
+    + ' GB · 显存 ' + (d.vram_gb == null ? '?' : d.vram_gb) + ' GB · CPU ' + (d.cpu || '?') + ' 核<br>'
+    + '已启用 ' + (l.mods || 0) + ' 个 · ' + (l.size_gb || 0) + ' GB · ' + (l.files || 0) + ' 文件 · '
+    + '<span style="color:' + color + '">' + label + '</span>';
+  const warn = (l.warnings || []).concat(h || []);
+  if (warn.length) html += '<br><span style="color:#ffd166">' + esc(warn[0]) + '</span>';
+  el.innerHTML = html;
+  el.title = warn.join(String.fromCharCode(10));
 }
 
 /* ---------------- 渲染 ---------------- */

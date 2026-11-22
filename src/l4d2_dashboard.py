@@ -65,6 +65,7 @@ class Manager:
         self.pending = []
         self.reapply_list = {}
         self._base_cache = None
+        self._device_cache = None
 
     # ---------------- 路径安全 ----------------
     @staticmethod
@@ -180,6 +181,26 @@ class Manager:
         if self._unit_version(rec["unit"]) != version:
             raise _ObjChanged("对象内容已变化,请重新扫描后再操作")
         return rec
+
+    def _device(self):
+        if self._device_cache is None:
+            self._device_cache = core.get_device_info(self.game_dir)
+        return self._device_cache
+
+    def _unit_size(self, unit):
+        try:
+            if os.path.isfile(unit):
+                return os.path.getsize(unit)
+            total = 0
+            for root, dirs, files in os.walk(unit, onerror=lambda e: None):
+                for fn in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, fn))
+                    except OSError:
+                        pass
+            return total
+        except OSError:
+            return 0
 
     def _base_index(self):
         path = os.path.join(self.game_dir, "pak01_dir.vpk")
@@ -405,6 +426,7 @@ class Manager:
                 root = self.disabled_dir if rec["zone"] == "disabled" else self.addons_dir
                 physical_disabled = rec["zone"] == "disabled"
                 listed_enabled, pending_apply = unit_state(rec)
+                unit_bytes = self._unit_size(rec["unit"])
                 out_addons.append({
                     "unit_id": unit_id,
                     "version": unit_ver(unit_id, rec["unit"]),
@@ -425,6 +447,7 @@ class Manager:
                     "physical_disabled": physical_disabled,
                     "listed_disabled": (not physical_disabled and not listed_enabled),
                     "pending_apply": pending_apply,
+                    "size_bytes": unit_bytes,
                     "keys": unit_keys(rec),
                 })
             out_addons.sort(key=lambda d: (d["disabled"], d["display_name"].lower()))
@@ -454,8 +477,68 @@ class Manager:
                     "addons": providers,
                 })
 
-            enabled_count = sum(1 for d in out_addons if not d["disabled"])
+            enabled_units = [d for d in out_addons if not d["disabled"]]
+            enabled_count = len(enabled_units)
             disabled_count = len(out_addons) - enabled_count
+            load_size = sum(d.get("size_bytes", 0) for d in enabled_units)
+            load_files = sum(d.get("file_count", 0) for d in enabled_units)
+            device = self._device()
+
+            level = "ok"
+            load_warnings = []
+            if enabled_count > 80 or load_size > 4 * 1024 ** 3 or load_files > 150000:
+                level = "risk"
+            elif enabled_count > 40 or load_size > 2 * 1024 ** 3 or load_files > 80000:
+                level = "warn"
+            if device.get("ram_avail_gb") is not None and device["ram_avail_gb"] < 2:
+                level = "risk"
+                load_warnings.append("可用内存不足 2GB")
+            if device.get("disk_free_gb") is not None and device["disk_free_gb"] < 5:
+                if level == "ok":
+                    level = "warn"
+                load_warnings.append("磁盘剩余不足 5GB")
+            if enabled_count > 80:
+                load_warnings.append(f"已启用 {enabled_count} 个模组,超出建议上限")
+            elif enabled_count > 40:
+                load_warnings.append(f"已启用 {enabled_count} 个模组,偏多")
+            if load_size > 4 * 1024 ** 3:
+                load_warnings.append(f"模组总体积 {load_size / 1024 ** 3:.1f} GB,超出建议")
+            elif load_size > 2 * 1024 ** 3:
+                load_warnings.append(f"模组总体积 {load_size / 1024 ** 3:.1f} GB,偏大")
+
+            health = []
+            try:
+                vpk_keys = []
+                for root_dir in (os.path.join(self.addons_dir, "workshop"), self.addons_dir):
+                    if not os.path.isdir(root_dir):
+                        continue
+                    if root_dir == os.path.join(self.addons_dir, "workshop"):
+                        walker = os.walk(root_dir, onerror=lambda e: None)
+                    else:
+                        walker = [(root_dir, [], [f for f in os.listdir(root_dir)
+                                                  if os.path.isfile(os.path.join(root_dir, f))])]
+                    for root2, _dirs, files in walker:
+                        for f in files:
+                            if f.lower().endswith(".vpk"):
+                                key = os.path.relpath(os.path.join(root2, f),
+                                                      self.addons_dir).replace("/", "\\")
+                                vpk_keys.append(core._norm_addon_key(key))
+                listed_keys = {core._norm_addon_key(k) for k in listed}
+                unlisted = [k for k in vpk_keys if k not in listed_keys]
+                if unlisted:
+                    health.append(f"{len(unlisted)} 个 VPK 未写入 addonlist,会被游戏默认启用")
+            except Exception:
+                pass
+            try:
+                dl = os.path.join(self.game_dir, "downloads")
+                if os.path.isdir(dl):
+                    n = len([f for f in os.listdir(dl) if f.lower().endswith(".dat")])
+                    if n:
+                        health.append(f"服务器自定义内容 {n} 个(downloads),可能导致报错")
+            except Exception:
+                pass
+            if os.path.isdir(os.path.join(self.game_dir, "ems")):
+                health.append("存在 EMS 自定义脚本(ems)")
 
             return {
                 "game_dir": self.game_dir,
@@ -477,6 +560,15 @@ class Manager:
                 "warnings": warnings,
                 "incomplete": bool(warnings),
                 "game_running": self._game_running(),
+                "device": device,
+                "load": {
+                    "mods": enabled_count,
+                    "size_gb": round(load_size / 1024 ** 3, 2),
+                    "files": load_files,
+                    "level": level,
+                    "warnings": load_warnings,
+                },
+                "health": health,
                 "pending": len(self.pending),
                 "pending_items": [{"name": p["name"], "action": p["action"]}
                                   for p in self.pending],
@@ -580,6 +672,42 @@ class Manager:
                 if self._game_running():
                     raise _GameRunning("游戏正在运行,松散文件被占用;请退出游戏后再操作")
                 return False, f"移动失败: {e}"
+
+    def disable_unlisted(self):
+        """把未写入 addonlist 的 VPK 显式禁用(游戏默认会加载它们)。"""
+        with self.lock:
+            listed = core.load_addonlist(self.addons_dir)
+            keys = []
+            for root_dir in (os.path.join(self.addons_dir, "workshop"), self.addons_dir):
+                if not os.path.isdir(root_dir):
+                    continue
+                if root_dir == os.path.join(self.addons_dir, "workshop"):
+                    walker = os.walk(root_dir, onerror=lambda e: None)
+                else:
+                    walker = [(root_dir, [], [f for f in os.listdir(root_dir)
+                                              if os.path.isfile(os.path.join(root_dir, f))])]
+                for root2, _dirs, files in walker:
+                    for f in files:
+                        if not f.lower().endswith(".vpk"):
+                            continue
+                        key = os.path.relpath(os.path.join(root2, f),
+                                              self.addons_dir).replace("/", "\\")
+                        if core._norm_addon_key(key) not in listed:
+                            keys.append(key)
+            if not keys:
+                return True, "没有未登记的 VPK"
+            desired = self._load_desired()
+            for k in keys:
+                desired[core._norm_addon_key(k)] = [k, False]
+            try:
+                self._save_desired(desired)
+            except OSError as e:
+                return False, f"写入目标状态失败: {e}"
+            if not self._game_running():
+                self._reconcile_locked()
+                return True, f"已禁用 {len(keys)} 个未登记 VPK"
+            self._spawn_apply_helper()
+            return True, f"已记录 {len(keys)} 个未登记 VPK,游戏退出后禁用"
 
     def enable(self, unit_id, version):
         with self.lock:
@@ -885,6 +1013,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(wid, (str, int)):
                     raise ValueError
                 ok, msg = m.open_workshop(str(wid))
+            elif action == "disable_unlisted":
+                ok, msg = m.disable_unlisted()
             elif action == "apply_and_launch":
                 ok, msg = m.apply_and_launch()
             elif action == "open_disabled":

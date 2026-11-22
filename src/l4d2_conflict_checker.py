@@ -539,6 +539,62 @@ def _running_game_dirs():
         return []
 
 
+def get_device_info(game_dir):
+    """读取本机内存/显卡/磁盘信息(失败字段为 None)。"""
+    info = {
+        "ram_total_gb": None, "ram_avail_gb": None,
+        "cpu": os.cpu_count(),
+        "gpu": None, "vram_gb": None,
+        "disk_free_gb": None, "disk_total_gb": None,
+    }
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(m)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            info["ram_total_gb"] = round(m.ullTotalPhys / 1024 ** 3, 1)
+            info["ram_avail_gb"] = round(m.ullAvailPhys / 1024 ** 3, 1)
+    except Exception:
+        pass
+    try:
+        import shutil
+        u = shutil.disk_usage(game_dir)
+        info["disk_free_gb"] = round(u.free / 1024 ** 3, 1)
+        info["disk_total_gb"] = round(u.total / 1024 ** 3, 1)
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        import json as _json
+        flags = 0x08000000 if os.name == "nt" else 0
+        out = _sp.check_output(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -First 1 "
+             "-Property Name,AdapterRAM | ConvertTo-Json -Compress"],
+            timeout=5, creationflags=flags)
+        j = _json.loads(out.decode("utf-8", "ignore") or "{}")
+        info["gpu"] = j.get("Name")
+        if j.get("AdapterRAM"):
+            info["vram_gb"] = round(int(j["AdapterRAM"]) / 1024 ** 3, 1)
+    except Exception:
+        pass
+    return info
+
+
 def game_running():
     """是否有正在运行的 left4dead2.exe。"""
     try:
