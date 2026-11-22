@@ -94,6 +94,11 @@
             <button class="btn btn-ghost" onclick="doAction('open_disabled',{})">打开隔离区</button>
           </div>
           <button class="btn" style="width:100%;margin-top:8px" onclick="confirmUnlisted()">禁用未登记 VPK</button>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px">
+            <button class="btn btn-ghost btn-sm" onclick="confirmDisableAll()">禁用全部</button>
+            <button class="btn btn-ghost btn-sm" onclick="confirmRemoveAll()">移除本地</button>
+            <button class="btn btn-ghost btn-sm" onclick="doAction('open_subscriptions',{})">我的订阅</button>
+          </div>
         </div>
       </div>
     </section>
@@ -323,6 +328,25 @@ function currentRows() {
 }
 
 /* ---------------- 设备/负载 ---------------- */
+function confirmDisableAll() {
+  showModal({
+    title: '禁用全部模组',
+    desc: '将把所有模组写入 addonlist 为关闭(0 启用),可逆。继续?',
+    confirmText: '全部禁用',
+    onConfirm: () => doAction('disable_all', {}),
+  });
+}
+
+function confirmRemoveAll() {
+  showModal({
+    title: '移除本地模组',
+    desc: '将把工坊 VPK 移到 _manager_backup 备份,并清空 addonlist。Steam 仍订阅,下次启动可能重新下载;要彻底取消请用「我的订阅」。继续?',
+    confirmText: '移除本地',
+    danger: true,
+    onConfirm: () => doAction('remove_all', {}),
+  });
+}
+
 function confirmUnlisted() {
   showModal({
     title: '禁用未登记 VPK',
@@ -559,7 +583,7 @@ async function doAction(action, payload, onFail) {
       return;
     }
     if (j.ok) {
-      if (action === 'open_workshop' || action === 'open_folder' || action === 'open_disabled') return;
+      if (action === 'open_workshop' || action === 'open_folder' || action === 'open_disabled' || action === 'open_subscriptions') return;
       scan();
     } else {
       if (r.status === 409) scan();

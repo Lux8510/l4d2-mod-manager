@@ -709,6 +709,84 @@ class Manager:
             self._spawn_apply_helper()
             return True, f"已记录 {len(keys)} 个未登记 VPK,游戏退出后禁用"
 
+    def _all_vpk_keys(self):
+        keys = []
+        for root_dir in (os.path.join(self.addons_dir, "workshop"), self.addons_dir):
+            if not os.path.isdir(root_dir):
+                continue
+            if root_dir == os.path.join(self.addons_dir, "workshop"):
+                walker = os.walk(root_dir, onerror=lambda e: None)
+            else:
+                walker = [(root_dir, [], [f for f in os.listdir(root_dir)
+                                          if os.path.isfile(os.path.join(root_dir, f))])]
+            for root2, _dirs, files in walker:
+                for f in files:
+                    if f.lower().endswith(".vpk"):
+                        key = os.path.relpath(os.path.join(root2, f),
+                                              self.addons_dir).replace("/", "\\")
+                        keys.append(key)
+        return keys
+
+    def disable_all_mods(self):
+        """禁用所有模组(写入目标状态,可逆)。"""
+        with self.lock:
+            keys = self._all_vpk_keys()
+            if not keys:
+                return True, "没有可禁用的模组"
+            desired = self._load_desired()
+            for k in keys:
+                desired[core._norm_addon_key(k)] = [k, False]
+            try:
+                self._save_desired(desired)
+            except OSError as e:
+                return False, f"写入目标状态失败: {e}"
+            if not self._game_running():
+                self._reconcile_locked()
+                return True, f"已禁用全部 {len(keys)} 个模组"
+            self._spawn_apply_helper()
+            return True, f"已记录 {len(keys)} 个模组,游戏退出后禁用"
+
+    def remove_all_mods(self):
+        # 把所有本地 VPK 移到 _manager_backup 并清空 addonlist(可恢复)
+        with self.lock:
+            if self._game_running():
+                return False, "请先完全退出游戏,再移除本地模组"
+            workshop = os.path.join(self.addons_dir, "workshop")
+            top_vpks = []
+            if os.path.isdir(self.addons_dir):
+                top_vpks = [f for f in os.listdir(self.addons_dir)
+                            if f.lower().endswith(".vpk")]
+            if not os.path.isdir(workshop) and not top_vpks:
+                return True, "没有可移除的本地模组"
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            dest = os.path.join(self.game_dir, "_manager_backup",
+                                "removed_" + ts)
+            os.makedirs(dest, exist_ok=True)
+            moved = 0
+            try:
+                if os.path.isdir(workshop):
+                    shutil.move(workshop, os.path.join(dest, "workshop"))
+                    moved += 1
+                for f in top_vpks:
+                    shutil.move(os.path.join(self.addons_dir, f),
+                                os.path.join(dest, f))
+                    moved += 1
+            except OSError as e:
+                return False, "移动失败: %s(已移动部分保留在 %s)" % (e, dest)
+            try:
+                with open(core.addonlist_path(self.addons_dir), "w",
+                          encoding="utf-8", newline="\n") as f:
+                    f.write('"AddonList"\n{\n}\n')
+                self._save_desired({})
+            except OSError:
+                pass
+            return True, "已移除 %s 组本地模组到 %s(Steam 仍订阅,可能重新下载)" % (
+                moved, dest)
+
+    def open_subscriptions(self):
+        return self._open(
+            "https://steamcommunity.com/my/myworkshopfiles/?appid=550&browsefilter=mysubscriptions")
+
     def enable(self, unit_id, version):
         with self.lock:
             rec = self._resolve(unit_id, version)
@@ -1013,6 +1091,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(wid, (str, int)):
                     raise ValueError
                 ok, msg = m.open_workshop(str(wid))
+            elif action == "disable_all":
+                ok, msg = m.disable_all_mods()
+            elif action == "remove_all":
+                ok, msg = m.remove_all_mods()
+            elif action == "open_subscriptions":
+                ok, msg = m.open_subscriptions()
             elif action == "disable_unlisted":
                 ok, msg = m.disable_unlisted()
             elif action == "apply_and_launch":
